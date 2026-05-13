@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import argparse
-import base64
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import threading
@@ -10,11 +10,15 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-ROOT = Path(os.environ.get("CLAUDE_PROJECTS_DIR", "/Users/f/.claude/projects")).expanduser()
+ROOT = Path(os.environ.get("CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude/projects"))).expanduser()
+CLI_COMMAND = os.environ.get("CLAUDE_BROWSER_CLI", "claude")
+AUTH_TOKEN = secrets.token_urlsafe(24)
 TEXT_SUFFIXES = {".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".log", ".csv", ".tsv"}
 MAX_TEXT_BYTES = 1024 * 1024
+MAX_LISTED_FILES = 200
+MAX_REQUEST_BYTES = 64 * 1024
 SERVER = None
 PAGE_CLIENTS = set()
 PAGE_LOCK = threading.Lock()
@@ -36,6 +40,43 @@ def one_line(text, limit):
 
 def iso_from_mtime(path):
     return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+
+
+def is_loopback_host(host):
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def preview_unavailable_reason(path):
+    try:
+        if path.stat().st_size > MAX_TEXT_BYTES:
+            return "文件超过 1MB"
+    except OSError:
+        return "无法读取文件信息"
+    if path.suffix.lower() not in TEXT_SUFFIXES:
+        return "暂不支持该文件类型"
+    return "无法读取文件内容"
+
+
+def safe_file_node(path, root, sessions_by_file):
+    try:
+        return file_node(path, root, sessions_by_file)
+    except OSError as exc:
+        try:
+            rel = str(path.relative_to(root))
+        except ValueError:
+            rel = path.name
+        return {
+            "id": str(path),
+            "type": "file",
+            "name": path.name,
+            "path": str(path),
+            "relativePath": rel,
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "size": 0,
+            "text": None,
+            "textAvailable": False,
+            "previewReason": f"无法读取：{exc}",
+        }
 
 
 def display_project_path(dirname):
@@ -169,12 +210,20 @@ def read_text_file(path):
         return None
 
 
+def list_child_nodes(path, root, sessions_by_file):
+    try:
+        children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError:
+        return []
+    return [safe_file_node(child, root, sessions_by_file) for child in children]
+
+
 def file_node(path, root, sessions_by_file):
     stat = path.stat()
     rel = str(path.relative_to(root))
     node_id = str(path)
     if path.is_dir():
-        children = [file_node(child, root, sessions_by_file) for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))]
+        children = list_child_nodes(path, root, sessions_by_file)
         return {
             "id": node_id,
             "type": "directory",
@@ -210,6 +259,7 @@ def file_node(path, root, sessions_by_file):
         "size": stat.st_size,
         "text": text,
         "textAvailable": text is not None,
+        "previewReason": "" if text is not None else preview_unavailable_reason(path),
     }
 
 
@@ -219,9 +269,14 @@ def scan():
         return {"root": str(ROOT), "projects": []}
 
     for project_dir in sorted((path for path in ROOT.iterdir() if path.is_dir() and project_name(path.name) != ".claude"), key=lambda p: display_project_path(p.name).lower()):
-        sessions = [read_session(path) for path in sorted(project_dir.rglob("*.jsonl"))]
+        sessions = []
+        for path in sorted(project_dir.rglob("*.jsonl")):
+            try:
+                sessions.append(read_session(path))
+            except OSError:
+                continue
         sessions_by_file = {session["file"]: session for session in sessions}
-        children = [file_node(child, project_dir, sessions_by_file) for child in sorted(project_dir.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))]
+        children = list_child_nodes(project_dir, project_dir, sessions_by_file)
         if not children:
             continue
         sessions.sort(key=lambda item: item["updated"], reverse=True)
@@ -258,7 +313,7 @@ def rename_session(path_value, title):
     if not path_value:
         raise ValueError("缺少路径")
     target = Path(path_value).expanduser().resolve()
-    if root not in target.parents:
+    if target == root or root not in target.parents:
         raise ValueError("只能重命名 Claude projects 目录内的会话")
     if target.suffix != ".jsonl" or not target.exists():
         raise ValueError("只能重命名存在的 jsonl 会话文件")
@@ -289,14 +344,14 @@ def open_session_in_terminal(path_value):
     if not path_value:
         raise ValueError("缺少路径")
     target = Path(path_value).expanduser().resolve()
-    if root not in target.parents:
+    if target == root or root not in target.parents:
         raise ValueError("只能打开 Claude projects 目录内的会话")
     if target.suffix != ".jsonl" or not target.exists():
         raise ValueError("只能打开存在的 jsonl 会话文件")
     session = read_session(target)
     cwd = session.get("cwd") or str(target.parent)
     session_id = session.get("sessionId") or target.stem
-    resume_command = f"cd {shlex.quote(cwd)} && claude-gpt --resume {shlex.quote(session_id)}"
+    resume_command = f"cd {shlex.quote(cwd)} && {shlex.quote(CLI_COMMAND)} --resume {shlex.quote(session_id)}"
     command = f"zsh -ic {shlex.quote(resume_command)}"
     script = f'''
         tell application "Terminal"
@@ -333,8 +388,16 @@ def contained_files(path_value):
     if not target.exists():
         raise FileNotFoundError("路径不存在")
     if target.is_file():
-        return [str(target)]
-    return [str(path) for path in sorted(target.rglob("*"), key=lambda p: str(p).lower()) if path.is_file()]
+        return {"files": [str(target)], "total": 1, "limited": False}
+    files = []
+    total = 0
+    for path in sorted(target.rglob("*"), key=lambda p: str(p).lower()):
+        if not path.is_file():
+            continue
+        total += 1
+        if len(files) < MAX_LISTED_FILES:
+            files.append(str(path))
+    return {"files": files, "total": total, "limited": total > len(files)}
 
 
 HTML = r'''<!doctype html>
@@ -342,7 +405,7 @@ HTML = r'''<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Claude 会话浏览器</title>
+<title>Claude 会话管理器</title>
 <style>
 :root{--line:#e8e5df;--text:#252525;--muted:#8b8b8b;--bubble:#f1f1f1;--selected:#e8e1d8}
 *{box-sizing:border-box}body{margin:0;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC",sans-serif;color:var(--text);background:#fff;overflow:hidden}.app{height:100vh;display:grid;grid-template-columns:380px minmax(0,1fr);overflow:hidden}.side{height:100vh;min-width:0;background:linear-gradient(180deg,#eef5f8,#f2ece6);border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;left:0;top:0;overflow:hidden}.traffic{height:32px;flex:0 0 32px;display:flex;align-items:center;gap:8px;padding:0 18px}.dot{width:12px;height:12px;border-radius:50%}.red{background:#ff5f57}.yellow{background:#febc2e}.green{background:#28c840}.actions{padding:6px 18px 10px;display:grid;gap:7px;flex:0 0 auto}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px}.nav{color:#4e5860;font-weight:650}.search{width:100%;border:0;background:rgba(255,255,255,.75);border-radius:10px;padding:8px 12px;outline:0}.meta{display:flex;align-items:center;justify-content:flex-end;gap:6px}.delete-icon{border:0;background:transparent;width:13px;height:13px;padding:0;cursor:pointer;background-image:url('data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%201024%201024%22%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%3E%3Cpath%20d%3D%22M512%201024a512%20512%200%201%201%20512-512%20512%20512%200%200%201-512%20512z%22%20fill%3D%22%23FFE8E6%22/%3E%3Cpath%20d%3D%22M710.509714%20313.490286a28.379429%2028.379429%200%200%200-40.155428%200l-157.257143%20157.257143-157.257143-157.257143a28.306286%2028.306286%200%201%200-40.009143%2040.009143l157.330286%20157.257142-157.330286%20157.330286a28.379429%2028.379429%200%200%200%2040.155429%2040.155429l157.330285-157.330286%20155.501715%20155.501714a28.306286%2028.306286%200%200%200%2040.009143-40.009143L553.325714%20510.902857l157.257143-157.257143a28.379429%2028.379429%200%200%200-0.073143-40.155428z%22%20fill%3D%22%23FF7A65%22/%3E%3C/svg%3E');background-size:13px 13px;background-repeat:no-repeat;background-position:center}.delete-icon:hover{opacity:.75}.section{padding:8px 18px 4px;color:#9a9a9a;font-weight:650;flex:0 0 auto}.tree{flex:1;overflow:auto;padding-bottom:16px}.item{padding:4px 18px;display:grid;grid-template-columns:1fr auto;gap:4px 10px;border-left:3px solid transparent;cursor:pointer}.item:hover{background:rgba(255,255,255,.45)}.item.active{background:var(--selected);border-left-color:#b7a694}.title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{font-size:12px;color:var(--muted);white-space:nowrap}.sub{grid-column:1/3;font-size:12px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.project{padding-top:6px;padding-bottom:5px}.project .title{font-weight:650}.folder .title:before,.project .title:before{content:'▸';display:inline-block;width:20px;color:#777;font-size:1.5em;line-height:.8;vertical-align:-1px}.folder.expanded .title:before,.project.expanded .title:before{content:'▾'}.file .title:before{content:'·';display:inline-block;width:20px;color:#aaa}.memory-file .title:before{content:'';display:inline-block;width:0}.session .title:before{content:'';display:inline-block;width:0}.main{height:100vh;min-width:0;display:grid;grid-template-rows:58px minmax(0,1fr);background:#fff;overflow:hidden}.top{border-bottom:1px solid #f0f0f0;padding:0 24px;display:flex;align-items:center;justify-content:space-between;gap:20px;overflow:hidden}.heading{min-width:0}.heading h1{font-size:16px;margin:0;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.path{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:58vw}.stats{display:flex;gap:8px;align-items:center;white-space:nowrap}.pill,.btn{border:1px solid #dedede;background:#fafafa;border-radius:999px;padding:3px 9px;color:#666;font-size:12px}.btn{cursor:pointer}.delete-btn{border-color:#ffd1cc;background:#ffe8e6;color:#ff7a65}.chat{min-height:0;overflow:auto;padding:34px 44px}.empty{text-align:center;color:var(--muted);margin-top:18vh}.msg{max-width:980px;margin:0 auto 24px}.msg.user{display:flex;justify-content:flex-end}.role{font-size:12px;color:var(--muted);margin-bottom:6px}.bubble{max-width:760px;background:var(--bubble);border-radius:18px;padding:14px 16px;white-space:pre-wrap;overflow-wrap:anywhere}.assistant .bubble{max-width:920px;background:#fff;border-radius:0;padding:0}.tool{display:inline-block;color:#666;background:#f5f5f5;border:1px solid #e7e7e7;border-radius:7px;padding:1px 6px}.file-view{max-width:980px;margin:0 auto}.file-content{background:#fbfbfb;border:1px solid #e8e8e8;border-radius:12px;padding:16px;white-space:pre-wrap;overflow:auto}pre{background:#f6f6f6;border:1px solid #e8e8e8;border-radius:12px;padding:14px;overflow:auto;white-space:pre-wrap}.small{font-size:12px;color:var(--muted);padding:8px 18px}
@@ -357,7 +420,7 @@ HTML = r'''<!doctype html>
     <div class="section">项目</div><div id="tree" class="tree"></div>
   </aside>
   <main class="main">
-    <div class="top"><div class="heading"><h1 id="title">Claude 会话浏览器</h1><div id="path" class="path">只读扫描本地 Claude Code 项目数据</div></div><div id="stats" class="stats"></div></div>
+    <div class="top"><div class="heading"><h1 id="title">Claude 会话管理器</h1><div id="path" class="path">管理本地 Claude Code 项目数据</div></div><div id="stats" class="stats"></div></div>
     <div id="chat" class="chat"><div class="empty">选择左侧文件或会话查看内容</div></div>
   </main>
 </div>
@@ -372,40 +435,43 @@ HTML = r'''<!doctype html>
 </div>
 <script>
 let data=null, selectedProject=null, selectedNode=null, query='', expanded=new Set(), clientId=crypto.randomUUID();
+const AUTH_TOKEN=new URLSearchParams(location.search).get('token')||'__AUTH_TOKEN__';
 const el=id=>document.getElementById(id);
 function escapeHtml(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function relTime(iso){const seconds=(Date.now()-new Date(iso))/1000;if(seconds<3600)return Math.max(1,Math.floor(seconds/60))+' 分钟';if(seconds<86400)return Math.floor(seconds/3600)+' 小时';if(seconds<2592000)return Math.floor(seconds/86400)+' 天';return Math.floor(seconds/2592000)+' 月'}
 function includes(text){return !query || (text||'').toLowerCase().includes(query.toLowerCase())}
 function sizeText(n){if(n==null)return '';if(n<1024)return n+' B';if(n<1048576)return Math.round(n/1024)+' KB';return (n/1048576).toFixed(1)+' MB'}
+function authBody(body={}){return JSON.stringify({...body,token:AUTH_TOKEN})}
+function authUrl(path){return `${path}${path.includes('?')?'&':'?'}token=${encodeURIComponent(AUTH_TOKEN)}`}
 function allNodes(nodes){let out=[];for(const node of nodes){out.push(node);if(node.children)out=out.concat(allNodes(node.children))}return out}
 function nodeMatches(node){const own=includes([node.name,node.fileName,node.relativePath,node.type==='session'?node.session&&node.session.firstUser:''].join(' '));const child=(node.children||[]).some(nodeMatches);return own||child}
 function render(){renderTree();renderContent()}
-function renderTree(){let html='';for(const project of data.projects){const projectMatches=includes(project.name+' '+project.pathHint)||project.children.some(nodeMatches);if(!projectMatches)continue;const open=expanded.has(project.id)||Boolean(query);const deleteButton=`${relTime(project.updated)}前`;html+=`<div class="item project ${open?'expanded':''} ${selectedNode&&selectedNode.id===project.id?'active':''}" data-id="${escapeHtml(project.id)}" data-type="project"><div class="title">${escapeHtml(project.name)}</div><div class="meta">${deleteButton}</div><div class="sub">${escapeHtml(project.pathHint)}</div></div>`;if(open)html+=renderNodes(project.children,1)}el('tree').innerHTML=html||'<div class="small">没有匹配内容</div>'}
+function renderTree(){let html='';for(const project of data.projects){const projectMatches=includes(project.name+' '+project.pathHint)||project.children.some(nodeMatches);if(!projectMatches)continue;const open=expanded.has(project.id)||Boolean(query);const updatedText=`${relTime(project.updated)}前`;html+=`<div class="item project ${open?'expanded':''} ${selectedNode&&selectedNode.id===project.id?'active':''}" data-id="${escapeHtml(project.id)}" data-type="project"><div class="title">${escapeHtml(project.name)}</div><div class="meta">${updatedText}</div><div class="sub">${escapeHtml(project.pathHint)}</div></div>`;if(open)html+=renderNodes(project.children,1)}el('tree').innerHTML=html||'<div class="small">没有匹配内容</div>'}
 function renderNodes(nodes,level){let html='';for(const node of nodes){if(!nodeMatches(node))continue;const isFolder=node.type==='directory';const open=isFolder&&(expanded.has(node.id)||Boolean(query));const cls=isFolder?'folder':(node.type==='file'&&node.relativePath.startsWith('memory/')&&node.name.endsWith('.md')?'file memory-file':node.type);const active=selectedNode&&selectedNode.id===node.id?'active':'';const label=node.type==='session'?node.name:node.name;const meta=node.type==='directory'?'':relTime(node.updated)+'前';html+=`<div class="item ${cls} ${open?'expanded':''} ${active}" style="padding-left:${18+level*20}px" data-id="${escapeHtml(node.id)}" data-type="${node.type}"><div class="title">${escapeHtml(label)}</div><div class="meta">${meta}</div></div>`;if(open)html+=renderNodes(node.children||[],level+1)}return html}
 function findProject(id){return data.projects.find(project=>project.id===id||allNodes(project.children).some(node=>node.id===id))}
 function findNode(id){for(const project of data.projects){if(project.id===id)return project;const found=allNodes(project.children).find(node=>node.id===id);if(found)return found}return null}
-function renderContent(){if(!selectedNode){el('title').textContent='Claude 会话浏览器';el('path').textContent='只读扫描 '+data.root;el('stats').innerHTML='';el('chat').innerHTML='<div class="empty">选择左侧文件或会话查看内容</div>';return}if(selectedNode.children){el('title').textContent=selectedNode.name;el('path').textContent=selectedNode.pathHint||selectedNode.path;el('stats').innerHTML=`<span class="pill">${selectedNode.children.length} 项</span>${selectedProject?`<span class="pill">${selectedProject.sessionCount} 个会话</span>`:''}<button class="btn" onclick="openInFinder()">在访达打开</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;el('chat').innerHTML='<div class="empty">选择这个目录下的文件或会话查看内容</div>';return}if(selectedNode.type==='session'){renderSession(selectedNode.session);return}renderFile(selectedNode)}
+function renderContent(){if(!selectedNode){el('title').textContent='Claude 会话管理器';el('path').textContent='管理本地 '+data.root;el('stats').innerHTML='';el('chat').innerHTML='<div class="empty">选择左侧文件或会话查看内容</div>';return}if(selectedNode.children){el('title').textContent=selectedNode.name;el('path').textContent=selectedNode.pathHint||selectedNode.path;el('stats').innerHTML=`<span class="pill">${selectedNode.children.length} 项</span>${selectedProject?`<span class="pill">${selectedProject.sessionCount} 个会话</span>`:''}<button class="btn" onclick="openInFinder()">在访达打开</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;el('chat').innerHTML='<div class="empty">选择这个目录下的文件或会话查看内容</div>';return}if(selectedNode.type==='session'){renderSession(selectedNode.session);return}renderFile(selectedNode)}
 function renderSession(session){el('title').textContent=session.title;el('path').textContent=session.cwd||session.file;el('stats').innerHTML=`<span class="pill">${session.messageCount} 条消息</span><button class="btn" onclick="copyPath()">复制路径</button><button class="btn" onclick="renameCurrentSession()">重命名</button><button class="btn" onclick="openInTerminal()">在终端打开</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;let html='';for(const message of session.messages){let text=escapeHtml(message.text);text=text.replace(/```([\s\S]*?)```/g,'<pre>$1</pre>').replace(/\[工具调用\]|\[工具结果\]/g,x=>`<span class="tool">${x}</span>`);html+=`<div class="msg ${message.role==='user'?'user':'assistant'}"><div><div class="role">${message.role==='user'?'你':'Claude'} · ${message.time?new Date(message.time).toLocaleString():''}</div><div class="bubble">${text}</div></div></div>`}el('chat').innerHTML=html||'<div class="empty">这个会话没有可展示消息</div>'}
-function renderFile(file){el('title').textContent=file.name;el('path').textContent=file.path;el('stats').innerHTML=`<span class="pill">${sizeText(file.size)}</span><span class="pill">${relTime(file.updated)}前</span><button class="btn" onclick="copyPath()">复制路径</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;const content=file.textAvailable?`<pre class="file-content">${escapeHtml(file.text)}</pre>`:`<div class="empty">这个文件暂不预览，但已在左侧文件树中展示</div>`;el('chat').innerHTML=`<div class="file-view">${content}</div>`}
+function renderFile(file){el('title').textContent=file.name;el('path').textContent=file.path;el('stats').innerHTML=`<span class="pill">${sizeText(file.size)}</span><span class="pill">${relTime(file.updated)}前</span><button class="btn" onclick="copyPath()">复制路径</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;const reason=file.previewReason?`：${escapeHtml(file.previewReason)}`:'';const content=file.textAvailable?`<pre class="file-content">${escapeHtml(file.text)}</pre>`:`<div class="empty">这个文件暂不预览${reason}</div>`;el('chat').innerHTML=`<div class="file-view">${content}</div>`}
 function selectItem(id,type){selectedNode=findNode(id);selectedProject=findProject(id);if(type==='project'||type==='directory'){if(expanded.has(id)){expanded.delete(id)}else{expanded.add(id)}}render()}
 function selectedPath(){if(!selectedNode)return '';return selectedNode.type==='session'?selectedNode.session.file:(selectedNode.path||selectedNode.dir)}
 function selectedKind(){if(!selectedNode)return '项目';if(selectedNode.type==='session')return '会话';if(selectedNode.type==='directory'||selectedNode.children)return '文件夹';return '文件'}
-async function openDeleteModal(){if(!selectedNode){alert('请先在左侧选择要删除的项目、文件夹、文件或会话');return}const path=selectedPath();const kind=selectedKind();el('modalTitle').textContent=`确定删除这个${kind}吗？`;el('modalName').textContent=selectedNode.name||selectedNode.title;el('modalPath').textContent=path;el('modalFiles').style.display='none';el('modalFiles').textContent='';if(kind==='文件夹'){const response=await fetch('/api/list-files',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法读取文件夹内容');return}el('modalFiles').style.display='block';el('modalFiles').textContent=payload.files.length?`将一并移到废纸篓的文件：\n${payload.files.join('\n')}`:'这个文件夹下没有文件';}el('confirmModal').style.display='flex'}
+async function openDeleteModal(){if(!selectedNode){alert('请先在左侧选择要删除的项目、文件夹、文件或会话');return}const path=selectedPath();const kind=selectedKind();el('modalTitle').textContent=`确定删除这个${kind}吗？`;el('modalName').textContent=selectedNode.name||selectedNode.title;el('modalPath').textContent=path;el('modalFiles').style.display='none';el('modalFiles').textContent='';if(kind==='文件夹'){const response=await fetch('/api/list-files',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法读取文件夹内容');return}el('modalFiles').style.display='block';if(payload.total){const prefix=payload.limited?`将一并移到废纸篓的文件：共 ${payload.total} 个，仅展示前 ${payload.files.length} 个：`:`将一并移到废纸篓的文件：共 ${payload.total} 个：`;el('modalFiles').textContent=`${prefix}\n${payload.files.join('\n')}`;}else{el('modalFiles').textContent='这个文件夹下没有文件';}}el('confirmModal').style.display='flex'}
 function closeDeleteModal(){el('confirmModal').style.display='none'}
-async function confirmTrash(){const path=selectedPath();const response=await fetch('/api/trash',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const payload=await response.json();if(!response.ok){alert(payload.error||'移动到废纸篓失败');return}closeDeleteModal();await reloadData()}
+async function confirmTrash(){const path=selectedPath();const response=await fetch('/api/trash',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path})});const payload=await response.json();if(!response.ok){alert(payload.error||'移动到废纸篓失败');return}closeDeleteModal();await reloadData()}
 function copyPath(){navigator.clipboard.writeText(selectedPath())}
-async function openInFinder(){if(!selectedNode||!selectedNode.children){alert('请先选择一个文件夹');return}const response=await fetch('/api/open-finder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:selectedNode.path||selectedNode.dir})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在访达打开')}}
-async function renameCurrentSession(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const title=prompt('输入新的会话名称：',selectedNode.session.title);if(title===null)return;const response=await fetch('/api/rename-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:selectedNode.session.file,title})});const payload=await response.json();if(!response.ok){alert(payload.error||'重命名失败');return}await reloadData(true)}
-async function openInTerminal(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const response=await fetch('/api/open-terminal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:selectedNode.session.file})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在终端打开')}}
-async function reloadData(keepSelection=false){const previousId=selectedNode&&selectedNode.id;const payload=await fetch('/api/data').then(response=>response.json());data=payload;selectedNode=null;selectedProject=data.projects[0]||null;if(keepSelection&&previousId){selectedNode=findNode(previousId);selectedProject=selectedNode?findProject(previousId):selectedProject}if(!selectedNode&&selectedProject){selectedNode=selectedProject;expanded.add(selectedProject.id)}render()}
+async function openInFinder(){if(!selectedNode||!selectedNode.children){alert('请先选择一个文件夹');return}const response=await fetch('/api/open-finder',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.path||selectedNode.dir})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在访达打开')}}
+async function renameCurrentSession(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const title=prompt('输入新的会话名称：',selectedNode.session.title);if(title===null)return;const response=await fetch('/api/rename-session',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file,title})});const payload=await response.json();if(!response.ok){alert(payload.error||'重命名失败');return}await reloadData(true)}
+async function openInTerminal(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const response=await fetch('/api/open-terminal',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在终端打开')}}
+async function reloadData(keepSelection=false){const previousId=selectedNode&&selectedNode.id;const payload=await fetch(authUrl('/api/data')).then(response=>response.json());data=payload;selectedNode=null;selectedProject=data.projects[0]||null;if(keepSelection&&previousId){selectedNode=findNode(previousId);selectedProject=selectedNode?findProject(previousId):selectedProject}if(!selectedNode&&selectedProject){selectedNode=selectedProject;expanded.add(selectedProject.id)}render()}
 el('query').addEventListener('input',event=>{query=event.target.value;render()});
 el('cancelDelete').addEventListener('click',closeDeleteModal);
 el('confirmDelete').addEventListener('click',confirmTrash);
 el('confirmModal').addEventListener('click',event=>{if(event.target.id==='confirmModal')closeDeleteModal()});
 el('tree').addEventListener('click',event=>{const item=event.target.closest('.item');if(!item)return;selectItem(item.dataset.id,item.dataset.type)});
-fetch('/api/open-page',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientId})});
-window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/close-page',new Blob([JSON.stringify({clientId})],{type:'application/json'})));
-fetch('/api/data').then(response=>response.json()).then(payload=>{data=payload;selectedProject=data.projects[0]||null;if(selectedProject){selectedNode=selectedProject;expanded.add(selectedProject.id)}render()});
+fetch('/api/open-page',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({clientId})});
+window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/close-page',new Blob([authBody({clientId})],{type:'application/json'})));
+fetch(authUrl('/api/data')).then(response=>response.json()).then(payload=>{data=payload;selectedProject=data.projects[0]||null;if(selectedProject){selectedNode=selectedProject;expanded.add(selectedProject.id)}render()});
 setInterval(()=>reloadData(true),60000);
 </script>
 </body>
@@ -425,8 +491,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def require_token(self, payload=None):
+        query = parse_qs(urlparse(self.path).query)
+        token = query.get("token", [None])[0]
+        if payload is not None:
+            token = payload.get("token") or token
+        if token != AUTH_TOKEN:
+            raise PermissionError("访问令牌无效，请从启动脚本打开页面")
+
     def read_json_body(self):
         length = int(self.headers.get("Content-Length", "0"))
+        if length > MAX_REQUEST_BYTES:
+            raise ValueError("请求内容过大")
         if length <= 0:
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
@@ -435,6 +511,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             payload = self.read_json_body()
+            self.require_token(payload)
             target = payload.get("path")
             if path == "/api/open-page":
                 client_id = payload.get("clientId")
@@ -467,12 +544,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True})
                 return
             self.send_json(404, {"error": "接口不存在"})
+        except PermissionError as exc:
+            self.send_json(403, {"error": str(exc)})
         except Exception as exc:
             self.send_json(400, {"error": str(exc)})
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/data":
+            try:
+                self.require_token()
+            except PermissionError as exc:
+                self.send_json(403, {"error": str(exc)})
+                return
             body = json.dumps(scan(), ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -482,7 +566,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        body = HTML.encode("utf-8")
+        body = HTML.replace("__AUTH_TOKEN__", AUTH_TOKEN).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -491,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="只读浏览 Claude Code 项目和历史会话")
+    parser = argparse.ArgumentParser(description="管理本地 Claude Code 项目和历史会话")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--json", action="store_true", help="只输出扫描结果，不启动网页服务")
@@ -501,10 +585,14 @@ def main():
         print(json.dumps(scan(), ensure_ascii=False, indent=2))
         return
 
+    if not is_loopback_host(args.host):
+        raise SystemExit("为保护本地会话数据，Claude 会话管理器只能绑定 127.0.0.1、localhost 或 ::1")
+
     global SERVER
     SERVER = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Claude 会话浏览器：http://{args.host}:{args.port}")
-    print(f"只读扫描：{ROOT}")
+    print(f"Claude 会话管理器：http://{args.host}:{args.port}/?token={AUTH_TOKEN}")
+    print(f"管理目录：{ROOT}")
+    print(f"终端命令：{CLI_COMMAND}")
     print("关闭 Safari 页面后服务会自动退出")
     SERVER.serve_forever()
 
