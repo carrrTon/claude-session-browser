@@ -1,59 +1,50 @@
-# Claude 浏览器
+# 为什么需要 Claude 浏览器
 
-一个本地 Claude Code 会话管理器，用来可视化浏览 `~/.claude/projects` 下的项目、会话和相关文件。
+Claude Code 的每个会话都依附在一个项目目录中。当你在多个长期、短期项目之间频繁切换，历史会话数量变多后，浏览、查找和恢复指定会话会变得比较麻烦。
 
-## 功能
+Claude 浏览器的设计初衷，是把本地 Claude Code 项目和会话整理成一个像 Codex 的可视化界面，让你像浏览文件管理器一样管理项目、会话和相关文件。基于 Claude Code 的本地存储方式，它也可以一同浏览项目记忆、项目subagent等文本文件。
 
-- 浏览 Claude Code 历史项目和会话
-- 查看 JSONL 会话内容、Markdown 和常见文本文件
-- 搜索左侧项目、文件夹、文件和会话
-- 重命名会话，不修改实际 `.jsonl` 文件名
-- 将选中的项目、文件夹、文件或会话移到废纸篓
-- 在 Finder 打开文件夹
-- 在 Terminal 中恢复选中的会话
-- 双击 `Claude浏览器.command` 一键启动 Safari
+这个工具只在本机运行，不是云端服务，也不会上传任何会话数据。
 
-## 启动方式
+## 核心功能
 
-双击：
+- 项目与会话浏览：
+  - 以树形目录结构展示本地 Claude Code 项目。
+  - 可查看 Claude 完整对话上下文、工具调用摘要和更新时间。
+  - 支持按更新时间或路径排序。
+  - 支持将常用项目置顶到独立的“置顶项目”分区。
+- 文件浏览：
+  - 可浏览项目记忆、项目 subagent 等其他文本文件。
+  - 支持 Markdown、TXT、JSON、JSONL、YAML、TOML、LOG、CSV、TSV 等文本文件预览。
+  - 单个文件预览上限为 1MB，过大或不支持的文件会显示原因。
+- 搜索与定位：
+  - 可搜索项目名、路径、文件名、会话标题和会话首条用户消息。
+- 会话管理：
+  - 可对会话重命名，且不修改原始 `.jsonl` 文件名，不影响 Claude 调取。
+  - 可将废弃项目或会话移到废纸篓。
+- 本机集成：
+  - 一键在访达打开文件夹。
+  - 一键在终端打开 Claude 并恢复选中会话。
+- 自动刷新与退出：
+  - 页面每 60 秒自动刷新一次数据，并可手动刷新。
+  - 页面关闭后，本地服务会在无活跃页面时自动退出。
+- 一键启动：
+  - 双击`Claude浏览器.command`启动本地服务，并自动打开网页界面。
 
-```text
-Claude浏览器.command
-```
 
-脚本会自动：
+## 工作方式
 
-1. 启动本地 Python 服务；
-2. 打开 Safari；
-3. 页面关闭后尝试自动关闭服务；
-4. 下次启动时只关闭本工具自己的旧服务。
+整体流程如下：
 
-## 依赖
+1. 本地 Python 服务启动后绑定到 `127.0.0.1:8765`。
+2. 服务生成一次性访问 token，并把 token 带到浏览器页面 URL 中。
+3. 前端页面请求 `/api/data` 获取项目、文件和会话数据。
+4. 服务实时扫描 Claude projects 数据目录，并返回当前文件系统状态。
+5. 用户在页面中浏览、搜索、重命名、删除或恢复会话。
+6. 页面每 60 秒重新拉取一次数据。
+7. 页面关闭后通知服务；如果没有活跃页面，服务自动退出。
+8. 可配置自定义claude启动命令，通过环境变量配置：export CLAUDE_BROWSER_CLI=your-claude-command
 
-- macOS
-- Python 3
-- Claude Code CLI
-- Safari 和 Terminal
-
-## 配置 Claude 命令
-
-默认使用：
-
-```bash
-claude-gpt --resume <sessionId>
-```
-
-如果你的命令是官方默认 `claude`，可以在启动前设置：
-
-```bash
-export CLAUDE_BROWSER_CLI=claude
-```
-
-也可以设置为其他兼容命令：
-
-```bash
-export CLAUDE_BROWSER_CLI=claude-gpt
-```
 
 ## 数据目录
 
@@ -69,10 +60,26 @@ export CLAUDE_BROWSER_CLI=claude-gpt
 export CLAUDE_PROJECTS_DIR=/path/to/projects
 ```
 
+## 本地个人设置
+
+用户置顶项目等个人偏好会保存到应用目录下的 `settings.local.json`（当前仓库根目录）。这个文件会在首次写入个人偏好时创建，不会写入 `~/.claude` 或 Claude projects 数据目录，也不应提交到 Git。
+
+
 ## 删除说明
 
 删除操作会调用 Finder 将文件移到废纸篓，不会直接物理删除。删除文件夹前会列出其中的文件，文件很多时只展示前 200 个并显示总数。
 
 ## 安全说明
 
-服务默认只绑定本机地址 `127.0.0.1`。页面启动时会生成本地访问 token，删除、重命名、打开 Terminal、打开 Finder 等接口都需要 token。
+服务默认只绑定本机地址 `127.0.0.1`，并禁止绑定非本机地址。页面启动时会生成本地访问 token，数据读取、删除、重命名、打开 Terminal、打开 Finder 等接口都需要 token。
+
+重命名、删除、打开 Finder、打开 Terminal 等操作只允许作用于 Claude projects 数据目录内的路径，避免误操作到其他本地文件。
+
+## 限制与边界
+
+- 目前仅面向 macOS 使用。
+- 一键启动依赖本机浏览器和 Terminal。
+- Finder 删除和 Terminal 恢复依赖 macOS 系统应用。
+- 不提供用户账号、远程访问或云同步能力。
+- 不修改 Claude Code 原始会话文件名。
+- 数据每次请求实时扫描，没有持久化索引缓存。

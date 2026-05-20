@@ -8,7 +8,7 @@ PORT="8765"
 LOG_PATH="/tmp/claude-session-browser.log"
 PID_PATH="/tmp/claude-session-browser.pid"
 CURRENT_TTY="$(tty)"
-export CLAUDE_BROWSER_CLI="${CLAUDE_BROWSER_CLI:-claude-gpt}"
+export CLAUDE_BROWSER_CLI="${CLAUDE_BROWSER_CLI:-claude}"
 
 close_this_terminal_window() {
   /usr/bin/osascript <<OSA >/dev/null 2>&1 &

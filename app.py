@@ -12,7 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+APP_DIR = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get("CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude/projects"))).expanduser()
+SETTINGS_PATH = APP_DIR / "settings.local.json"
 CLI_COMMAND = os.environ.get("CLAUDE_BROWSER_CLI", "claude")
 AUTH_TOKEN = secrets.token_urlsafe(24)
 TEXT_SUFFIXES = {".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".log", ".csv", ".tsv"}
@@ -22,6 +24,42 @@ MAX_REQUEST_BYTES = 64 * 1024
 SERVER = None
 PAGE_CLIENTS = set()
 PAGE_LOCK = threading.Lock()
+
+
+def empty_preferences():
+    return {"pinnedProjects": []}
+
+
+def normalize_preferences(value):
+    if not isinstance(value, dict):
+        return empty_preferences()
+    pinned = value.get("pinnedProjects", [])
+    if not isinstance(pinned, list):
+        pinned = []
+    return {"pinnedProjects": [item for item in pinned if isinstance(item, str)]}
+
+
+def read_settings():
+    if not SETTINGS_PATH.exists():
+        return {"preferences": empty_preferences()}
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"preferences": empty_preferences()}
+    if not isinstance(data, dict):
+        return {"preferences": empty_preferences()}
+    return {"preferences": normalize_preferences(data.get("preferences"))}
+
+
+def write_settings(settings):
+    SETTINGS_PATH.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def current_preferences():
+    return read_settings()["preferences"]
 
 
 def parse_time(value):
@@ -265,8 +303,9 @@ def file_node(path, root, sessions_by_file):
 
 def scan():
     projects = []
+    preferences = current_preferences()
     if not ROOT.exists():
-        return {"root": str(ROOT), "projects": []}
+        return {"root": str(ROOT), "preferences": preferences, "projects": []}
 
     for project_dir in sorted((path for path in ROOT.iterdir() if path.is_dir() and project_name(path.name) != ".claude"), key=lambda p: display_project_path(p.name).lower()):
         sessions = []
@@ -293,7 +332,35 @@ def scan():
             "children": children,
         })
 
-    return {"root": str(ROOT), "projects": projects}
+    return {"root": str(ROOT), "preferences": preferences, "projects": projects}
+
+
+def project_ids():
+    if not ROOT.exists():
+        return set()
+    ids = set()
+    for path in ROOT.iterdir():
+        if path.is_dir() and project_name(path.name) != ".claude":
+            ids.add(str(path))
+    return ids
+
+
+def set_project_pinned(project_id, pinned):
+    if not project_id:
+        raise ValueError("缺少项目")
+    allowed = project_ids()
+    if project_id not in allowed:
+        raise ValueError("只能置顶当前 Claude projects 目录内的项目")
+    settings = read_settings()
+    preferences = settings["preferences"]
+    pinned_projects = [item for item in preferences.get("pinnedProjects", []) if item in allowed]
+    if pinned:
+        if project_id not in pinned_projects:
+            pinned_projects.append(project_id)
+    else:
+        pinned_projects = [item for item in pinned_projects if item != project_id]
+    settings["preferences"] = {"pinnedProjects": pinned_projects}
+    write_settings(settings)
 
 
 def open_path_in_finder(path_value):
@@ -356,7 +423,7 @@ def open_session_in_terminal(path_value):
     script = f'''
         tell application "Terminal"
             activate
-            do script {json.dumps(command)}
+            do script {json.dumps(command, ensure_ascii=False)}
         end tell
     '''
     subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True)
@@ -420,7 +487,7 @@ HTML = r'''<!doctype html>
       <div class="nav">搜索</div>
       <input id="query" class="search" placeholder="搜索左侧项目、文件夹、文件和会话" />
     </div>
-    <div class="section toolbar"><span>项目</span><div class="meta"><button id="sortTime" class="btn sort-btn" type="button">时间 ↓</button><button id="sortPath" class="btn sort-btn" type="button">路径 ↓</button></div></div><div id="tree" class="tree"></div>
+    <div id="tree" class="tree"></div>
   </aside>
   <main class="main">
     <div class="top"><div class="heading"><h1 id="title">Claude 会话管理器</h1><div id="path" class="path">管理本地 Claude Code 项目数据</div></div><div id="stats" class="stats"></div></div>
@@ -437,7 +504,7 @@ HTML = r'''<!doctype html>
   </div>
 </div>
 <script>
-let data=null, selectedProject=null, selectedNode=null, query='', expanded=new Set(), clientId=crypto.randomUUID(), sortKey='time', sortDirection='desc';
+let data=null, selectedProject=null, selectedNode=null, query='', expanded=new Set(), pinnedProjectIds=new Set(), clientId=crypto.randomUUID(), pinnedSortKey='time', pinnedSortDirection='desc', regularSortKey='time', regularSortDirection='desc';
 const AUTH_TOKEN=new URLSearchParams(location.search).get('token')||'__AUTH_TOKEN__';
 const el=id=>document.getElementById(id);
 function escapeHtml(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -446,23 +513,31 @@ function includes(text){return !query || (text||'').toLowerCase().includes(query
 function sizeText(n){if(n==null)return '';if(n<1024)return n+' B';if(n<1048576)return Math.round(n/1024)+' KB';return (n/1048576).toFixed(1)+' MB'}
 function authBody(body={}){return JSON.stringify({...body,token:AUTH_TOKEN})}
 function authUrl(path){return `${path}${path.includes('?')?'&':'?'}token=${encodeURIComponent(AUTH_TOKEN)}`}
-function sortedProjects(){const projects=[...(data&&data.projects?data.projects:[])];projects.sort((a,b)=>{let result=0;if(sortKey==='path'){result=(a.pathHint||a.name||'').localeCompare(b.pathHint||b.name||'');}else{result=new Date(a.updated)-new Date(b.updated);}return sortDirection==='asc'?result:-result});return projects}
-function updateSortButtons(){el('sortTime').classList.toggle('active',sortKey==='time');el('sortPath').classList.toggle('active',sortKey==='path');el('sortTime').textContent=`时间 ${sortKey==='time'&&sortDirection==='asc'?'↑':'↓'}`;el('sortPath').textContent=`路径 ${sortKey==='path'&&sortDirection==='asc'?'↑':'↓'}`}
-function setSort(key){if(sortKey===key){sortDirection=sortDirection==='desc'?'asc':'desc';}else{sortKey=key;sortDirection='desc';}render()}
+function sortedProjectGroup(projects,key,direction){const items=[...projects];items.sort((a,b)=>{let result=0;if(key==='path'){result=(a.pathHint||a.name||'').localeCompare(b.pathHint||b.name||'');}else{result=new Date(a.updated)-new Date(b.updated);}return direction==='asc'?result:-result});return items}
+function sortedNodes(nodes,key,direction){const items=[...nodes];items.sort((a,b)=>{const aFolder=a.type==='directory';const bFolder=b.type==='directory';if(aFolder!==bFolder)return aFolder?-1:1;let result=0;if(key==='path'){result=(a.relativePath||a.name||'').localeCompare(b.relativePath||b.name||'');}else{result=new Date(a.updated||0)-new Date(b.updated||0);}return direction==='asc'?result:-result});return items}
+function syncPreferences(){pinnedProjectIds=new Set((data&&data.preferences&&Array.isArray(data.preferences.pinnedProjects))?data.preferences.pinnedProjects:[])}
+function pinnedProjects(){return (data&&data.projects?data.projects:[]).filter(project=>isProjectPinned(project))}
+function regularProjects(){return (data&&data.projects?data.projects:[]).filter(project=>!isProjectPinned(project))}
+function isProjectPinned(project){return Boolean(project&&pinnedProjectIds.has(project.id))}
+function groupSortButtons(group,key,direction){return `<button class="btn sort-btn ${key==='time'?'active':''}" type="button" onclick="setGroupSort('${group}','time')">时间 ${key==='time'&&direction==='asc'?'↑':'↓'}</button><button class="btn sort-btn ${key==='path'?'active':''}" type="button" onclick="setGroupSort('${group}','path')">路径 ${key==='path'&&direction==='asc'?'↑':'↓'}</button>`}
+function setGroupSort(group,key){if(group==='pinned'){if(pinnedSortKey===key){pinnedSortDirection=pinnedSortDirection==='desc'?'asc':'desc'}else{pinnedSortKey=key;pinnedSortDirection='desc'}}else{if(regularSortKey===key){regularSortDirection=regularSortDirection==='desc'?'asc':'desc'}else{regularSortKey=key;regularSortDirection='desc'}}render()}
 function allNodes(nodes){let out=[];for(const node of nodes){out.push(node);if(node.children)out=out.concat(allNodes(node.children))}return out}
 function nodeMatches(node){const own=includes([node.name,node.fileName,node.relativePath,node.type==='session'?node.session&&node.session.firstUser:''].join(' '));const child=(node.children||[]).some(nodeMatches);return own||child}
-function render(){updateSortButtons();renderTree();renderContent()}
-function renderTree(){let html='';for(const project of sortedProjects()){const projectMatches=includes(project.name+' '+project.pathHint)||project.children.some(nodeMatches);if(!projectMatches)continue;const open=expanded.has(project.id)||Boolean(query);const updatedText=`${relTime(project.updated)}前`;html+=`<div class="item project ${open?'expanded':''} ${selectedNode&&selectedNode.id===project.id?'active':''}" data-id="${escapeHtml(project.id)}" data-type="project"><div class="title">${escapeHtml(project.name)}</div><div class="meta">${updatedText}</div><div class="sub">${escapeHtml(project.pathHint)}</div></div>`;if(open)html+=renderNodes(project.children,1)}el('tree').innerHTML=html||'<div class="small">没有匹配内容</div>'}
-function renderNodes(nodes,level){let html='';for(const node of nodes){if(!nodeMatches(node))continue;const isFolder=node.type==='directory';const open=isFolder&&(expanded.has(node.id)||Boolean(query));const cls=isFolder?'folder':(node.type==='file'&&node.relativePath.startsWith('memory/')&&node.name.endsWith('.md')?'file memory-file':node.type);const active=selectedNode&&selectedNode.id===node.id?'active':'';const label=node.type==='session'?node.name:node.name;const meta=node.type==='directory'?'':relTime(node.updated)+'前';html+=`<div class="item ${cls} ${open?'expanded':''} ${active}" style="padding-left:${18+level*20}px" data-id="${escapeHtml(node.id)}" data-type="${node.type}"><div class="title">${escapeHtml(label)}</div><div class="meta">${meta}</div></div>`;if(open)html+=renderNodes(node.children||[],level+1)}return html}
-function findProject(id){return sortedProjects().find(project=>project.id===id||allNodes(project.children).some(node=>node.id===id))}
-function findNode(id){for(const project of sortedProjects()){if(project.id===id)return project;const found=allNodes(project.children).find(node=>node.id===id);if(found)return found}return null}
-function renderContent(){if(!selectedNode){el('title').textContent='Claude 会话管理器';el('path').textContent='管理本地 '+data.root;el('stats').innerHTML='';el('chat').innerHTML='<div class="empty">选择左侧文件或会话查看内容</div>';return}if(selectedNode.children){el('title').textContent=selectedNode.name;el('path').textContent=selectedNode.pathHint||selectedNode.path;el('stats').innerHTML=`<span class="pill">${selectedNode.children.length} 项</span>${selectedProject?`<span class="pill">${selectedProject.sessionCount} 个会话</span>`:''}<button class="btn" onclick="openInFinder()">在访达打开</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;el('chat').innerHTML='<div class="empty">选择这个目录下的文件或会话查看内容</div>';return}if(selectedNode.type==='session'){renderSession(selectedNode.session);return}renderFile(selectedNode)}
-function renderSession(session){el('title').textContent=session.title;el('path').textContent=session.cwd||session.file;el('stats').innerHTML=`<span class="pill">${session.messageCount} 条消息</span><button class="btn" onclick="copyPath()">复制路径</button><button class="btn" onclick="renameCurrentSession()">重命名</button><button class="btn" onclick="openInTerminal()">在终端打开</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;let html='';for(const message of session.messages){let text=escapeHtml(message.text);text=text.replace(/```([\s\S]*?)```/g,'<pre>$1</pre>').replace(/\[工具调用\]|\[工具结果\]/g,x=>`<span class="tool">${x}</span>`);html+=`<div class="msg ${message.role==='user'?'user':'assistant'}"><div><div class="role">${message.role==='user'?'你':'Claude'} · ${message.time?new Date(message.time).toLocaleString():''}</div><div class="bubble">${text}</div></div></div>`}el('chat').innerHTML=html||'<div class="empty">这个会话没有可展示消息</div>';scrollChatToBottom()}
+function render(){renderTree();renderContent()}
+function renderProjectGroup(title,projects,key,direction,group){let html='';const rows=sortedProjectGroup(projects,key,direction).filter(project=>includes(project.name+' '+project.pathHint)||project.children.some(nodeMatches));if(!rows.length)return '';html+=`<div class="section toolbar"><span>${escapeHtml(title)}</span><div class="meta">${groupSortButtons(group,key,direction)}</div></div>`;for(const project of rows){const open=expanded.has(project.id)||Boolean(query);const updatedText=`${relTime(project.updated)}前`;html+=`<div class="item project ${open?'expanded':''} ${selectedNode&&selectedNode.id===project.id?'active':''}" data-id="${escapeHtml(project.id)}" data-type="project"><div class="title">${escapeHtml(project.name)}</div><div class="meta">${updatedText}</div><div class="sub">${escapeHtml(project.pathHint)}</div></div>`;if(open)html+=renderNodes(project.children,1,key,direction)}return html}
+function renderTree(){let html='';const pinned=pinnedProjects();if(pinned.length)html+=renderProjectGroup('置顶项目',pinned,pinnedSortKey,pinnedSortDirection,'pinned');html+=renderProjectGroup('项目',regularProjects(),regularSortKey,regularSortDirection,'regular');el('tree').innerHTML=html||'<div class="small">没有匹配内容</div>'}
+function renderNodes(nodes,level,key,direction){let html='';for(const node of sortedNodes(nodes,key,direction)){if(!nodeMatches(node))continue;const isFolder=node.type==='directory';const open=isFolder&&(expanded.has(node.id)||Boolean(query));const cls=isFolder?'folder':(node.type==='file'&&node.relativePath.startsWith('memory/')&&node.name.endsWith('.md')?'file memory-file':node.type);const active=selectedNode&&selectedNode.id===node.id?'active':'';const label=node.type==='session'?node.name:node.name;const meta=node.type==='directory'?'':relTime(node.updated)+'前';html+=`<div class="item ${cls} ${open?'expanded':''} ${active}" style="padding-left:${18+level*20}px" data-id="${escapeHtml(node.id)}" data-type="${node.type}"><div class="title">${escapeHtml(label)}</div><div class="meta">${meta}</div></div>`;if(open)html+=renderNodes(node.children||[],level+1,key,direction)}return html}
+function findProject(id){return (data&&data.projects?data.projects:[]).find(project=>project.id===id||allNodes(project.children).some(node=>node.id===id))}
+function findNode(id){for(const project of (data&&data.projects?data.projects:[])){if(project.id===id)return project;const found=allNodes(project.children).find(node=>node.id===id);if(found)return found}return null}
+function renderContent(){if(!selectedNode){el('title').textContent='Claude 会话管理器';el('path').textContent='管理本地 '+data.root;el('stats').innerHTML='';el('chat').innerHTML='<div class="empty">选择左侧文件或会话查看内容</div>';return}if(selectedNode.children){el('title').textContent=selectedNode.name;el('path').textContent=selectedNode.pathHint||selectedNode.path;const rootProject=selectedRootProject();const pinButton=rootProject?`<button class="btn" onclick="togglePinProject()">${isProjectPinned(rootProject)?'取消置顶':'置顶'}</button>`:'';el('stats').innerHTML=`${pinButton}<button class="btn" onclick="copyPath()">复制路径</button><button class="btn" onclick="openInFinder()">在访达打开</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;el('chat').innerHTML='<div class="empty">选择这个目录下的文件或会话查看内容</div>';return}if(selectedNode.type==='session'){renderSession(selectedNode.session);return}renderFile(selectedNode)}
+function renderSession(session){el('title').textContent=session.title;el('path').textContent=session.cwd||session.file;el('stats').innerHTML=`<span class="pill">${session.messageCount} 条消息</span><button class="btn" onclick="copyPath()">复制路径</button><button class="btn" onclick="renameCurrentSession()">重命名</button><button class="btn" onclick="openInTerminal()">在 Claude 恢复</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;let html='';for(const message of session.messages){let text=escapeHtml(message.text);text=text.replace(/```([\s\S]*?)```/g,'<pre>$1</pre>').replace(/\[工具调用\]|\[工具结果\]/g,x=>`<span class="tool">${x}</span>`);html+=`<div class="msg ${message.role==='user'?'user':'assistant'}"><div><div class="role">${message.role==='user'?'你':'Claude'} · ${message.time?new Date(message.time).toLocaleString():''}</div><div class="bubble">${text}</div></div></div>`}el('chat').innerHTML=html||'<div class="empty">这个会话没有可展示消息</div>';scrollChatToBottom()}
 function renderFile(file){el('title').textContent=file.name;el('path').textContent=file.path;el('stats').innerHTML=`<span class="pill">${sizeText(file.size)}</span><span class="pill">${relTime(file.updated)}前</span><button class="btn" onclick="copyPath()">复制路径</button><button class="btn delete-btn" onclick="openDeleteModal()">删除</button>`;const reason=file.previewReason?`：${escapeHtml(file.previewReason)}`:'';const content=file.textAvailable?`<pre class="file-content">${escapeHtml(file.text)}</pre>`:`<div class="empty">这个文件暂不预览${reason}</div>`;el('chat').innerHTML=`<div class="file-view">${content}</div>`}
 function scrollChatToBottom(){requestAnimationFrame(()=>{const chat=el('chat');chat.scrollTop=chat.scrollHeight})}
 function selectItem(id,type){selectedNode=findNode(id);selectedProject=findProject(id);if(type==='project'||type==='directory'){if(expanded.has(id)){expanded.delete(id)}else{expanded.add(id)}}render()}
 function selectedPath(){if(!selectedNode)return '';return selectedNode.type==='session'?selectedNode.session.file:(selectedNode.path||selectedNode.dir)}
 function selectedKind(){if(!selectedNode)return '项目';if(selectedNode.type==='session')return '会话';if(selectedNode.type==='directory'||selectedNode.children)return '文件夹';return '文件'}
+function selectedRootProject(){return selectedNode&&selectedProject&&selectedNode.id===selectedProject.id?selectedProject:null}
+async function togglePinProject(){const project=selectedRootProject();if(!project){alert('请先选择一个项目');return}try{const response=await fetch('/api/pin-project',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({projectId:project.id,pinned:!isProjectPinned(project)})});let payload={};try{payload=await response.json()}catch{}if(!response.ok){alert(payload.error||'更新置顶状态失败');return}await reloadData(true)}catch{alert('更新置顶状态失败')}}
 async function openDeleteModal(){if(!selectedNode){alert('请先在左侧选择要删除的项目、文件夹、文件或会话');return}const path=selectedPath();const kind=selectedKind();el('modalTitle').textContent=`确定删除这个${kind}吗？`;el('modalName').textContent=selectedNode.name||selectedNode.title;el('modalPath').textContent=path;el('modalFiles').style.display='none';el('modalFiles').textContent='';if(kind==='文件夹'){const response=await fetch('/api/list-files',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法读取文件夹内容');return}el('modalFiles').style.display='block';if(payload.total){const prefix=payload.limited?`将一并移到废纸篓的文件：共 ${payload.total} 个，仅展示前 ${payload.files.length} 个：`:`将一并移到废纸篓的文件：共 ${payload.total} 个：`;el('modalFiles').textContent=`${prefix}\n${payload.files.join('\n')}`;}else{el('modalFiles').textContent='这个文件夹下没有文件';}}el('confirmModal').style.display='flex'}
 function closeDeleteModal(){el('confirmModal').style.display='none'}
 async function confirmTrash(){const path=selectedPath();const response=await fetch('/api/trash',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path})});const payload=await response.json();if(!response.ok){alert(payload.error||'移动到废纸篓失败');return}closeDeleteModal();await reloadData()}
@@ -470,17 +545,15 @@ function copyPath(){navigator.clipboard.writeText(selectedPath())}
 async function openInFinder(){if(!selectedNode||!selectedNode.children){alert('请先选择一个文件夹');return}const response=await fetch('/api/open-finder',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.path||selectedNode.dir})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在访达打开')}}
 async function renameCurrentSession(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const title=prompt('输入新的会话名称：',selectedNode.session.title);if(title===null)return;const response=await fetch('/api/rename-session',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file,title})});const payload=await response.json();if(!response.ok){alert(payload.error||'重命名失败');return}await reloadData(true)}
 async function openInTerminal(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const response=await fetch('/api/open-terminal',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在终端打开')}}
-async function reloadData(keepSelection=false){const previousId=selectedNode&&selectedNode.id;const payload=await fetch(authUrl('/api/data')).then(response=>response.json());data=payload;selectedNode=null;selectedProject=null;if(keepSelection&&previousId){selectedNode=findNode(previousId);selectedProject=selectedNode?findProject(previousId):null}render()}
+async function reloadData(keepSelection=false){const previousId=selectedNode&&selectedNode.id;const payload=await fetch(authUrl('/api/data')).then(response=>response.json());data=payload;syncPreferences();selectedNode=null;selectedProject=null;if(keepSelection&&previousId){selectedNode=findNode(previousId);selectedProject=selectedNode?findProject(previousId):null}render()}
 el('query').addEventListener('input',event=>{query=event.target.value;render()});
-el('sortTime').addEventListener('click',()=>setSort('time'));
-el('sortPath').addEventListener('click',()=>setSort('path'));
 el('cancelDelete').addEventListener('click',closeDeleteModal);
 el('confirmDelete').addEventListener('click',confirmTrash);
 el('confirmModal').addEventListener('click',event=>{if(event.target.id==='confirmModal')closeDeleteModal()});
 el('tree').addEventListener('click',event=>{const item=event.target.closest('.item');if(!item)return;selectItem(item.dataset.id,item.dataset.type)});
 fetch('/api/open-page',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({clientId})});
 window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/close-page',new Blob([authBody({clientId})],{type:'application/json'})));
-fetch(authUrl('/api/data')).then(response=>response.json()).then(payload=>{data=payload;selectedProject=null;selectedNode=null;render()});
+fetch(authUrl('/api/data')).then(response=>response.json()).then(payload=>{data=payload;syncPreferences();selectedProject=null;selectedNode=null;render()});
 setInterval(()=>reloadData(true),60000);
 </script>
 </body>
@@ -522,11 +595,16 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             self.require_token(payload)
             target = payload.get("path")
+            project_id = payload.get("projectId")
             if path == "/api/open-page":
                 client_id = payload.get("clientId")
                 if client_id:
                     with PAGE_LOCK:
                         PAGE_CLIENTS.add(client_id)
+                self.send_json(200, {"ok": True})
+                return
+            if path == "/api/pin-project":
+                set_project_pinned(project_id, bool(payload.get("pinned")))
                 self.send_json(200, {"ok": True})
                 return
             if path == "/api/open-finder":
