@@ -6,6 +6,10 @@ Claude 浏览器的设计初衷，是把本地 Claude Code 项目和会话整理
 
 这个工具只在本机运行，不是云端服务，也不会上传任何会话数据。
 
+## 界面预览
+
+![Claude 浏览器界面预览](images/screenshotdemo.png)
+
 ## 核心功能
 
 - 项目与会话浏览：
