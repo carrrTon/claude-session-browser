@@ -615,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True})
                 return
             if path == "/api/list-files":
-                self.send_json(200, {"files": contained_files(target)})
+                self.send_json(200, contained_files(target))
                 return
             if path == "/api/trash":
                 trash_path(target)
