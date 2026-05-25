@@ -2,7 +2,9 @@
 import argparse
 import json
 import os
+import re
 import secrets
+import shutil
 import shlex
 import subprocess
 import threading
@@ -129,6 +131,10 @@ def project_name(dirname):
     return parts[-1] if parts else dirname
 
 
+def project_dirname_for_cwd(cwd):
+    return re.sub(r"[^A-Za-z0-9-]", "-", str(Path(cwd).expanduser().resolve()).replace("/", "-"))
+
+
 def text_from_content(content):
     if isinstance(content, str):
         return content
@@ -179,6 +185,10 @@ def read_session(path):
                 if timestamp:
                     started = timestamp if started is None or timestamp < started else started
                     updated = timestamp if updated is None or timestamp > updated else updated
+
+                if obj.get("type") == "cwd-update":
+                    cwd = obj.get("cwd") or cwd
+                    continue
 
                 cwd = cwd or obj.get("cwd")
 
@@ -375,6 +385,112 @@ def open_path_in_finder(path_value):
     subprocess.run(["open", str(target)], check=True, capture_output=True, text=True)
 
 
+def choose_working_directory():
+    script = '''
+        set chosenFolder to choose folder with prompt "选择新的工作目录"
+        POSIX path of chosenFolder
+    '''
+    result = subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True)
+    return result.stdout.strip().rstrip("/") or "/"
+
+
+def project_dir_for_session(target, root):
+    rel = target.relative_to(root)
+    if not rel.parts:
+        raise ValueError("只能更新 Claude projects 目录内的会话")
+    return root / rel.parts[0]
+
+
+def append_cwd_update(path, cwd):
+    record = {"type": "cwd-update", "cwd": str(cwd), "timestamp": datetime.now(timezone.utc).isoformat()}
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def archive_project_dir(source_project, root):
+    archive_root = root / ".claude-session-browser-trash"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    archive_dir = archive_root / f"{source_project.name}-{timestamp}"
+    archive_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_project), str(archive_dir))
+    return archive_dir
+
+
+def write_migration_metadata(destination_project, source_project, archive_dir, cwd, selected_relative, migrated_files, migrated_sessions):
+    metadata = {
+        "type": "project-cwd-migration",
+        "migratedAt": datetime.now(timezone.utc).isoformat(),
+        "oldProjectDir": str(source_project.resolve()),
+        "archivedProjectDir": str(archive_dir.resolve()) if archive_dir else "",
+        "newProjectDir": str(destination_project.resolve()),
+        "newCwd": str(cwd),
+        "selectedSession": str(selected_relative),
+        "migratedFiles": migrated_files,
+        "migratedSessions": migrated_sessions,
+    }
+    (destination_project / ".claude-session-browser-migration.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def migrate_project_cwd(target, cwd, root):
+    source_project = project_dir_for_session(target, root)
+    destination_project = root / project_dirname_for_cwd(cwd)
+    selected_relative = target.relative_to(source_project)
+    selected_destination = destination_project / selected_relative
+    source_files = [path for path in sorted(source_project.rglob("*")) if path.is_file()]
+
+    same_project = source_project.resolve() == destination_project.resolve()
+    if not same_project:
+        for source_file in source_files:
+            destination_file = destination_project / source_file.relative_to(source_project)
+            if destination_file.exists() and destination_file.read_bytes() != source_file.read_bytes():
+                raise ValueError(f"目标项目中已存在不同内容的文件：{destination_file}")
+        for source_file in source_files:
+            destination_file = destination_project / source_file.relative_to(source_project)
+            destination_file.parent.mkdir(parents=True, exist_ok=True)
+            if not destination_file.exists():
+                destination_file.write_bytes(source_file.read_bytes())
+
+    migrated_sessions = 0
+    for source_file in source_files:
+        destination_file = destination_project / source_file.relative_to(source_project)
+        if destination_file.suffix == ".jsonl":
+            append_cwd_update(destination_file, cwd)
+            migrated_sessions += 1
+
+    archive_dir = None if same_project else archive_project_dir(source_project, root)
+    write_migration_metadata(destination_project, source_project, archive_dir, cwd, selected_relative, len(source_files), migrated_sessions)
+
+    return {
+        "ok": True,
+        "cwd": str(cwd),
+        "file": str(selected_destination.resolve()),
+        "projectDir": str(destination_project.resolve()),
+        "archivedProjectDir": str(archive_dir.resolve()) if archive_dir else "",
+        "migratedFiles": len(source_files),
+        "migratedSessions": migrated_sessions,
+    }
+
+
+def update_session_cwd(path_value, cwd_value):
+    root = ROOT.resolve()
+    if not path_value:
+        raise ValueError("缺少路径")
+    target = Path(path_value).expanduser().resolve()
+    if target == root or root not in target.parents:
+        raise ValueError("只能更新 Claude projects 目录内的会话")
+    if target.suffix != ".jsonl" or not target.exists():
+        raise ValueError("只能更新存在的 jsonl 会话文件")
+    if not cwd_value:
+        raise ValueError("缺少工作目录")
+    cwd = Path(cwd_value).expanduser().resolve()
+    if not cwd.exists() or not cwd.is_dir():
+        raise ValueError("工作目录不存在")
+    return migrate_project_cwd(target, cwd, root)
+
+
 def rename_session(path_value, title):
     root = ROOT.resolve()
     if not path_value:
@@ -418,6 +534,8 @@ def open_session_in_terminal(path_value):
     session = read_session(target)
     cwd = session.get("cwd") or str(target.parent)
     session_id = session.get("sessionId") or target.stem
+    if not Path(cwd).expanduser().exists():
+        return {"ok": False, "missingCwd": cwd, "canChooseDirectory": True}
     resume_command = f"cd {shlex.quote(cwd)} && {shlex.quote(CLI_COMMAND)} --resume {shlex.quote(session_id)}"
     command = f"zsh -ic {shlex.quote(resume_command)}"
     script = f'''
@@ -427,6 +545,7 @@ def open_session_in_terminal(path_value):
         end tell
     '''
     subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True)
+    return {"ok": True}
 
 
 def trash_path(path_value):
@@ -543,7 +662,7 @@ async function confirmTrash(){const path=selectedPath();const response=await fet
 function copyPath(){navigator.clipboard.writeText(selectedPath())}
 async function openInFinder(){if(!selectedNode||!selectedNode.children){alert('请先选择一个文件夹');return}const response=await fetch('/api/open-finder',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.path||selectedNode.dir})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在访达打开')}}
 async function renameCurrentSession(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const title=prompt('输入新的会话名称：',selectedNode.session.title);if(title===null)return;const response=await fetch('/api/rename-session',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file,title})});const payload=await response.json();if(!response.ok){alert(payload.error||'重命名失败');return}await reloadData(true)}
-async function openInTerminal(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const response=await fetch('/api/open-terminal',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在终端打开')}}
+async function openInTerminal(){if(!selectedNode||selectedNode.type!=='session'){alert('请先选择一个会话');return}const response=await fetch('/api/open-terminal',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file})});const payload=await response.json();if(!response.ok){alert(payload.error||'无法在终端打开');return}if(payload.canChooseDirectory&&payload.missingCwd){if(!confirm(`原工作目录不存在：\n${payload.missingCwd}\n\n是否选择新的工作目录？`))return;const chooseResponse=await fetch('/api/choose-working-directory',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({})});const choosePayload=await chooseResponse.json();if(!chooseResponse.ok){alert(choosePayload.error||'未选择新的工作目录');return}const updateResponse=await fetch('/api/update-session-cwd',{method:'POST',headers:{'Content-Type':'application/json'},body:authBody({path:selectedNode.session.file,cwd:choosePayload.cwd})});const updatePayload=await updateResponse.json();if(!updateResponse.ok){alert(updatePayload.error||'更新工作目录失败');return}await reloadData(true);if(updatePayload.file){selectedNode=findNode(updatePayload.file);selectedProject=selectedNode?findProject(updatePayload.file):null}await openInTerminal()}}
 async function reloadData(keepSelection=false){const previousId=selectedNode&&selectedNode.id;const payload=await fetch(authUrl('/api/data')).then(response=>response.json());data=payload;syncPreferences();selectedNode=null;selectedProject=null;if(keepSelection&&previousId){selectedNode=findNode(previousId);selectedProject=selectedNode?findProject(previousId):null}render()}
 el('query').addEventListener('input',event=>{query=event.target.value;render()});
 el('cancelDelete').addEventListener('click',closeDeleteModal);
@@ -622,8 +741,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True})
                 return
             if path == "/api/open-terminal":
-                open_session_in_terminal(target)
-                self.send_json(200, {"ok": True})
+                self.send_json(200, open_session_in_terminal(target))
+                return
+            if path == "/api/choose-working-directory":
+                self.send_json(200, {"ok": True, "cwd": choose_working_directory()})
+                return
+            if path == "/api/update-session-cwd":
+                self.send_json(200, update_session_cwd(target, payload.get("cwd")))
                 return
             if path == "/api/rename-session":
                 rename_session(target, payload.get("title"))
